@@ -16,7 +16,9 @@
          render/2,
          render/3,
          parse_binary/1,
+         parse_binary/2,
          parse_file/1,
+         parse_file/2,
          compile/2,
          compile/3
         ]).
@@ -24,21 +26,33 @@
 -export_type([
               template/0,
               data/0,
-              option/0
+              option/0, % deprecated
+              compile_option/0,
+              parse_option/0,
+              render_option/0
              ]).
 
 %%----------------------------------------------------------------------------------------------------------------------
 %% Defines & Records & Types
 %%----------------------------------------------------------------------------------------------------------------------
 
--define(PARSE_ERROR, incorrect_format).
--define(FILE_ERROR,  file_not_found).
+-define(PARSE_ERROR,                incorrect_format).
+-define(FILE_ERROR,                 file_not_found).
+-define(CONTEXT_MISSING_ERROR(Msg), {context_missing, Msg}).
+
 -define(IIF(Cond, TValue, FValue),
         case Cond of true -> TValue; false -> FValue end).
 
 -define(ADD(X, Y), ?IIF(X =:= <<>>, Y, [X | Y])).
 -define(START_TAG, <<"{{">>).
 -define(STOP_TAG,  <<"}}">>).
+
+-define(RAISE_ON_CONTEXT_MISS_ENABLED(Options),
+        proplists:get_bool(raise_on_context_miss, Options)).
+-define(RAISE_ON_PARTIAL_MISS_ENABLED(Options),
+        proplists:get_bool(raise_on_partial_miss, Options)).
+
+-define(PARSE_OPTIONS, [raise_on_partial_miss]).
 
 -type key()    :: binary().
 %% Key MUST be a non-whitespace character sequence NOT containing the current closing delimiter. <br />
@@ -73,8 +87,12 @@
 -record(?MODULE,
         {
           data               :: [tag()],
-          partials      = [] :: [{key(), [tag()]}],
-          options       = [] :: [option()],
+
+          partials      = [] :: [{key(), [tag()]} | key()],
+          %% The `{key(), [tag()]}` indicates that `key()` already parsed and `[tag()]` is the result of parsing.
+          %% The `key()` indicates that the file did not exist.
+
+          options       = [] :: [compile_option()],
           indents       = [] :: [binary()],
           context_stack = [] :: [data()]
         }).
@@ -101,8 +119,23 @@
 
 -type assoc_data() :: [{atom(), data_value()}] | [{binary(), data_value()}] | [{string(), data_value()}].
 
--type option()     :: {key_type, atom | binary | string}.
+-type parse_option() :: raise_on_partial_miss.
+%% - raise_on_partial_miss: If the template used in partials does not found, it will throw an exception (error).
+
+-type compile_option() :: {key_type, atom | binary | string}
+                       | raise_on_context_miss
+                       | {escape_fun, fun((binary()) -> binary())}.
 %% - key_type: Specify the type of the key in {@link data/0}. Default value is `string'.
+%% - raise_on_context_miss: If key exists in template does not exist in data, it will throw an exception (error).
+%% - escape_fun: Specify your own escape function.
+
+-type render_option() :: compile_option() | parse_option().
+%% @see compile_option/0
+%% @see parse_option/0
+
+-type option() :: compile_option().
+%% This type has been deprecated since 1.6.0. It will remove in 2.0.0.
+%% @see compile_option/0
 
 -ifdef(namespaced_types).
 -type maps_data() :: #{atom() => data_value()} | #{binary() => data_value()} | #{string() => data_value()}.
@@ -110,7 +143,7 @@
 -else.
 -type data()      :: assoc_data().
 -endif.
-%% All key in assoc list or maps must be same type.
+%% All keys MUST be same type.
 %% @see render/2
 %% @see compile/2
 
@@ -126,28 +159,41 @@ render(Bin, Data) ->
     render(Bin, Data, []).
 
 %% @equiv compile(parse_binary(Bin), Data, Options)
--spec render(binary(), data(), [option()]) -> binary().
+-spec render(binary(), data(), [render_option()]) -> binary().
 render(Bin, Data, Options) ->
-    compile(parse_binary(Bin), Data, Options).
+    {ParseOptions, CompileOptions} = lists:partition(fun(X) -> lists:member(X, ?PARSE_OPTIONS) end, Options),
+    compile(parse_binary(Bin, ParseOptions), Data, CompileOptions).
 
-%% @doc Create a {@link template/0} from a binary.
+%% @equiv parse_binary(Bin, [])
 -spec parse_binary(binary()) -> template().
 parse_binary(Bin) when is_binary(Bin) ->
-    parse_binary_impl(#state{}, Bin).
+    parse_binary(Bin, []).
 
-%% @doc Create a {@link template/0} from a file.
+%% @doc Create a {@link template/0} from a binary.
+-spec parse_binary(binary(), [parse_option()]) -> template().
+parse_binary(Bin, Options) ->
+    {State, Data} = parse(#state{}, Bin),
+    parse_remaining_partials(State, #?MODULE{data = Data}, Options).
+
+%% @equiv parse_file(Filename, [])
 -spec parse_file(file:filename_all()) -> template().
 parse_file(Filename) ->
+    parse_file(Filename, []).
+
+%% @doc Create a {@link template/0} from a file.
+-spec parse_file(file:filename_all(), [parse_option()]) -> template().
+parse_file(Filename, Options) ->
     State = #state{dirname = filename:dirname(Filename)},
-    case to_binary(filename:extension(Filename)) of
-        <<".mustache">> = Ext ->
-            Partials = [Key = to_binary(filename:basename(Filename, Ext))],
-            parse_binary_impl(State#state{partials = Partials}, #?MODULE{data = [{'>', Key, <<>>}]});
+    case file:read_file(Filename) of
+        {ok, Bin} ->
+            {State1, Data} = parse(State, Bin),
+            Template = case to_binary(filename:extension(Filename)) of
+                           <<".mustache">> = Ext -> #?MODULE{partials = [{filename:basename(Filename, Ext), Data}], data = Data};
+                           _                     -> #?MODULE{data = Data}
+                       end,
+            parse_remaining_partials(State1, Template, Options);
         _ ->
-            case file:read_file(Filename) of
-                {ok, Bin} -> parse_binary_impl(State, Bin);
-                _         -> error(?FILE_ERROR, [Filename])
-            end
+            error(?FILE_ERROR, [Filename, Options])
     end.
 
 %% @equiv compile(Template, Data, [])
@@ -162,9 +208,9 @@ compile(Template, Data) ->
 %% 2> bbmustache:compile(Template, #{"name" => "Alice"}).
 %% <<"Alice">>
 %% '''
-%% Data support assoc list or maps (OTP17 or later). <br />
-%% All key in assoc list or maps MUST be same type.
--spec compile(template(), data(), [option()]) -> binary().
+%% Data support an associative array or a map. <br />
+%% All keys MUST be same type.
+-spec compile(template(), data(), [compile_option()]) -> binary().
 compile(#?MODULE{data = Tags} = T, Data, Options) ->
     case check_data_type(Data) of
         false -> error(function_clause, [T, Data]);
@@ -184,7 +230,9 @@ compile(#?MODULE{data = Tags} = T, Data, Options) ->
 compile_impl([], _, Result, _) ->
     Result;
 compile_impl([{n, Keys} | T], Map, Result, State) ->
-    compile_impl(T, Map, ?ADD(escape(to_iodata(get_data_recursive(Keys, Map, <<>>, State))), Result), State);
+    Value = iolist_to_binary(to_iodata(get_data_recursive(Keys, Map, <<>>, State))),
+    EscapeFun = proplists:get_value(escape_fun, State#?MODULE.options, fun escape/1),
+    compile_impl(T, Map, ?ADD(EscapeFun(Value), Result), State);
 compile_impl([{'&', Keys} | T], Map, Result, State) ->
     compile_impl(T, Map, ?ADD(to_iodata(get_data_recursive(Keys, Map, <<>>, State)), Result), State);
 compile_impl([{'#', Keys, Tags, Source} | T], Map, Result, State) ->
@@ -212,7 +260,11 @@ compile_impl([{'^', Keys, Tags} | T], Map, Result, State) ->
     end;
 compile_impl([{'>', Key, Indent} | T], Map, Result0, #?MODULE{partials = Partials} = State) ->
     case proplists:get_value(Key, Partials) of
-        undefined -> compile_impl(T, Map, Result0, State);
+        undefined ->
+            case ?RAISE_ON_CONTEXT_MISS_ENABLED(State#?MODULE.options) of
+                true  -> error(?CONTEXT_MISSING_ERROR({?FILE_ERROR, Key}));
+                false -> compile_impl(T, Map, Result0, State)
+            end;
         PartialT  ->
             Indents = State#?MODULE.indents ++ [Indent],
             Result1 = compile_impl(PartialT, Map, [Indent | Result0], State#?MODULE{indents = Indents}),
@@ -227,14 +279,13 @@ compile_impl([B1 | [_|_] = T], Map, Result, #?MODULE{indents = Indents} = State)
 compile_impl([Bin | T], Map, Result, State) ->
     compile_impl(T, Map, [Bin | Result], State).
 
-%% @see parse_binary/1
--spec parse_binary_impl(state(), Input | template()) -> template() when
-      Input :: binary().
-parse_binary_impl(#state{partials = []}, Template = #?MODULE{}) ->
+%% @doc Parse remaining partials in State. It returns {@link template/0}.
+-spec parse_remaining_partials(state(), template(), [parse_option()]) -> template().
+parse_remaining_partials(#state{partials = []}, Template = #?MODULE{}, _Options) ->
     Template;
-parse_binary_impl(State = #state{partials = [P | PartialKeys]}, Template = #?MODULE{partials = Partials}) ->
+parse_remaining_partials(State = #state{partials = [P | PartialKeys]}, Template = #?MODULE{partials = Partials}, Options) ->
     case proplists:is_defined(P, Partials) of
-        true  -> parse_binary_impl(State#state{partials = PartialKeys}, Template);
+        true  -> parse_remaining_partials(State#state{partials = PartialKeys}, Template, Options);
         false ->
             Filename0 = <<P/binary, ".mustache">>,
             Dirname   = State#state.dirname,
@@ -242,14 +293,15 @@ parse_binary_impl(State = #state{partials = [P | PartialKeys]}, Template = #?MOD
             case file:read_file(Filename) of
                 {ok, Input} ->
                     {State1, Data} = parse(State, Input),
-                    parse_binary_impl(State1, Template#?MODULE{partials = [{P, Data} | Partials]});
-                _ ->
-                    parse_binary_impl(State, Template#?MODULE{partials = [{P, []}]})
+                    parse_remaining_partials(State1, Template#?MODULE{partials = [{P, Data} | Partials]}, Options);
+                {error, Reason} ->
+                    case ?RAISE_ON_PARTIAL_MISS_ENABLED(Options) of
+                        true  -> error({?FILE_ERROR, P, Reason});
+                        false -> parse_remaining_partials(State#state{partials = PartialKeys},
+                                                          Template#?MODULE{partials = [P | Partials]}, Options)
+                    end
             end
-    end;
-parse_binary_impl(State, Input) ->
-    {State1, Data} = parse(State, Input),
-    parse_binary_impl(State1, #?MODULE{data = Data}).
+    end.
 
 %% @doc Analyze the syntax of the mustache.
 -spec parse(state(), binary()) -> {#state{}, [tag()]}.
@@ -374,7 +426,7 @@ parse_delimiter(State0, ParseDelimiterBin, NextBin, Result) ->
 %% 3> split_tag(State, <<"...">>)
 %% [<<"...">>]
 %% '''
--spec split_tag(state(), binary()) -> [binary()].
+-spec split_tag(state(), binary()) -> [binary(), ...].
 split_tag(#state{start = StartDelimiter, stop = StopDelimiter}, Bin) ->
     case binary:match(Bin, StartDelimiter) of
         nomatch ->
@@ -433,7 +485,7 @@ standalone(State, Post0, Result0) ->
     end.
 
 %% @doc If the binary is repeatedly the character, return true. Otherwise, return false.
--spec repeatedly_binary(binary(), char()) -> boolean().
+-spec repeatedly_binary(binary(), byte()) -> boolean().
 repeatedly_binary(<<X, Rest/binary>>, X) ->
     repeatedly_binary(Rest, X);
 repeatedly_binary(<<>>, _) ->
@@ -516,20 +568,19 @@ to_iodata(X) ->
     X.
 
 %% @doc string or binary to binary
--spec to_binary(binary() | string()) -> binary().
+-spec to_binary(binary() | [byte()]) -> binary().
 to_binary(Bin) when is_binary(Bin) ->
     Bin;
-to_binary(Str) when is_list(Str) ->
-    list_to_binary(Str).
+to_binary(Bytes) when is_list(Bytes) ->
+    list_to_binary(Bytes).
 
 %% @doc HTML Escape
--spec escape(iodata()) -> binary().
-escape(IoData) ->
-    Bin = iolist_to_binary(IoData),
+-spec escape(binary()) -> binary().
+escape(Bin) ->
     << <<(escape_char(X))/binary>> || <<X:8>> <= Bin >>.
 
 %% @doc escape a character if needed.
--spec escape_char(0..16#FFFF) -> binary().
+-spec escape_char(byte()) -> <<_:8, _:_*8>>.
 escape_char($<) -> <<"&lt;">>;
 escape_char($>) -> <<"&gt;">>;
 escape_char($&) -> <<"&amp;">>;
@@ -550,26 +601,39 @@ convert_keytype(KeyBin, #?MODULE{options = Options}) ->
         binary -> KeyBin
     end.
 
-%% @doc fetch the value of the specified parent.child from {@link data/0}
+%% @doc fetch the value of the specified `Keys' from {@link data/0}
 %%
-%% if key is ".", it means this.
+%% - If `Keys' is `[<<".">>]', it returns `Data'.
+%% - If raise_on_context_miss enabled, it raise an exception when missing `Keys'. Otherwise, it returns `Default'.
 -spec get_data_recursive([key()], data(), Default :: term(), template()) -> term().
-get_data_recursive([], Data, _, _) ->
-    Data;
-get_data_recursive([<<".">>], Data, _, _) ->
-	Data;
-get_data_recursive([Key | RestKey] = Keys, Data, Default, #?MODULE{context_stack = Stack} = State) ->
-	case find_data(convert_keytype(Key, State), Data) of
+get_data_recursive(Keys, Data, Default, Template) ->
+    case get_data_recursive_impl(Keys, Data, Template) of
+        {ok, Term} -> Term;
+        error      ->
+            case ?RAISE_ON_CONTEXT_MISS_ENABLED(Template#?MODULE.options) of
+                true  -> error(?CONTEXT_MISSING_ERROR({key, binary_join(Keys, <<".">>)}));
+                false -> Default
+            end
+    end.
+
+%% @see get_data_recursive/4
+-spec get_data_recursive_impl([key()], data(), template()) -> {ok, term()} | error.
+get_data_recursive_impl([], Data, _) ->
+    {ok, Data};
+get_data_recursive_impl([<<".">>], Data, _) ->
+    {ok, Data};
+get_data_recursive_impl([Key | RestKey] = Keys, Data, #?MODULE{context_stack = Stack} = State) ->
+    case check_data_type(Data) =:= true andalso find_data(convert_keytype(Key, State), Data) of
         {ok, ChildData} ->
-            get_data_recursive(RestKey, ChildData, Default, State#?MODULE{context_stack = []});
-        error when Stack =:= [] ->
-            Default;
-        error ->
-            get_data_recursive(Keys, hd(Stack), Default, State#?MODULE{context_stack = tl(Stack)})
+            get_data_recursive_impl(RestKey, ChildData, State#?MODULE{context_stack = []});
+        _ when Stack =:= [] ->
+            error;
+        _ ->
+            get_data_recursive_impl(Keys, hd(Stack), State#?MODULE{context_stack = tl(Stack)})
     end.
 
 %% @doc find the value of the specified key from {@link data/0}
--spec find_data(data_key(), data()) -> {ok, Value ::term()} | error.
+-spec find_data(data_key(), data() | term()) -> {ok, Value ::term()} | error.
 -ifdef(namespaced_types).
 find_data(Key, Map) when is_map(Map) ->
     maps:find(Key, Map);
